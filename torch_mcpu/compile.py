@@ -118,6 +118,22 @@ def _register_mcpu_inductor_fallback_lowerings() -> None:
         )
 
 
+def _register_mcpu_inductor_metadata_lowerings() -> None:
+    import torch._inductor.lowering as lowering
+    from torch._inductor.virtualized import V
+
+    op = torch.ops.aten.sym_storage_offset.default
+    if op in lowering.lowerings:
+        return
+
+    # Like sym_size/sym_stride, this must use view metadata. Falling back
+    # through a realized buffer loses the offset of an intermediate view.
+    @lowering.register_lowering(op)
+    def sym_storage_offset(input):
+        value = V.graph.current_node.meta["val"]
+        return value.node.expr if isinstance(value, torch.SymInt) else int(value)
+
+
 @dataclass(frozen=True)
 class McpuDeviceProperties:
     name: str
@@ -270,6 +286,7 @@ def setup_mcpu_compile() -> None:
     _setup_inductor_cpp_device_build_flags()
     _register_mcpu_aoti_fallback_shims()
     _register_mcpu_inductor_fallback_lowerings()
+    _register_mcpu_inductor_metadata_lowerings()
     # Keep automatic pattern fusion opt-in. Explicit torch_xcpu/vLLM custom
     # operators remain available, but ordinary ATen graphs must not silently
     # turn into asynchronous raw-pointer fused kernels.
