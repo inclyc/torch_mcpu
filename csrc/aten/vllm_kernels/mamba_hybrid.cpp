@@ -419,9 +419,6 @@ void vllm_postprocess_mamba_impl(
       has_idx_mapping || num_accepted_tokens_out.has_value(),
       "V1 postprocess requires num_accepted_tokens_out");
   VLLM_MCPU_CHECK(
-      !has_idx_mapping || !num_accepted_tokens_out.has_value(),
-      "V2 postprocess updates num_accepted_tokens in place");
-  VLLM_MCPU_CHECK(
       !idx_mapping || idx_mapping->numel() >= num_reqs,
       "idx_mapping must cover num_reqs");
 
@@ -457,17 +454,19 @@ void vllm_postprocess_mamba_impl(
             "mcpu::vllm_postprocess_mamba", timing_event);
         at::mcpu::KernelAllMemoryGuard guard;
         for (int64_t batch_index = 0; batch_index < num_reqs; ++batch_index) {
+          const int32_t request_index =
+              has_idx_mapping ? idx_ptr[batch_index] : batch_index;
+          if (request_index < 0) {
+            continue;
+          }
+          VLLM_MCPU_CHECK(
+              request_index < max_num_reqs,
+              "idx_mapping contains an out-of-range request index");
+          // Legacy in-place callers must also preserve the decision across
+          // all layer states when state zero resets the acceptance count.
+          const int64_t num_accepted = accepted_ptr[request_index];
           for (int64_t state_index = 0; state_index < total_states;
                ++state_index) {
-            const int32_t request_index =
-                has_idx_mapping ? idx_ptr[batch_index] : batch_index;
-            if (request_index < 0) {
-              continue;
-            }
-            VLLM_MCPU_CHECK(
-                request_index < max_num_reqs,
-                "idx_mapping contains an out-of-range request index");
-            const int64_t num_accepted = accepted_ptr[request_index];
             const int32_t source_block_index = state_ptr[request_index];
             int64_t new_num_computed;
             int64_t num_tokens_running_state;
@@ -498,10 +497,10 @@ void vllm_postprocess_mamba_impl(
                 "postprocess mamba indices exceed int32");
             if (source_block_index == destination_block_index &&
                 state_index == 0) {
-              if (has_idx_mapping) {
-                accepted_ptr[request_index] = 1;
-              } else {
+              if (accepted_out_ptr != nullptr) {
                 accepted_out_ptr[request_index] = 1;
+              } else {
+                accepted_ptr[request_index] = 1;
               }
             }
             if (source_block_index == destination_block_index &&

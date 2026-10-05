@@ -208,6 +208,48 @@ class TestV2ModelStateKernels(TestCase):
             torch.tensor([1, 77, 1, 6], dtype=torch.int32),
         )
 
+    def test_postprocess_align_preserves_acceptance_for_all_layer_states(self):
+        # A same-block checkpoint resets acceptance to one, but every layer
+        # must still save the state for the originally accepted token.
+        def device_tensor(values, dtype=torch.int32):
+            return torch.tensor(values, dtype=dtype, device="mcpu")
+
+        block_table = device_tensor([[1, 2, 3, 4], [0, 0, 0, 0]])
+        states = [
+            (torch.arange(20, dtype=torch.float32).reshape(5, 4) + i * 100)
+            .to("mcpu") for i in range(3)
+        ]
+        before = [state.cpu().clone() for state in states]
+        accepted = device_tensor([77, 88, 3])
+        torch.ops.mcpu.vllm_postprocess_mamba(
+            accepted,
+            device_tensor([0, 0, 0]),
+            None,
+            device_tensor([0, 0, 4]),
+            None,
+            device_tensor([block_table.data_ptr()], torch.int64),
+            block_table.stride(0),
+            device_tensor([state.data_ptr() for state in states], torch.int64),
+            device_tensor([16] * 3, torch.int64),
+            device_tensor([4] * 3),
+            device_tensor([4] * 3, torch.int64),
+            device_tensor([0] * 3),
+            device_tensor([0] * 3),
+            device_tensor([0] * 3),
+            device_tensor([0] * 3, torch.int64),
+            None,
+            device_tensor([2, -1]),
+            2, 3, 4, False, True, True,
+        )
+        torch.mcpu.synchronize()
+        for state, original in zip(states, before):
+            expected = original.clone()
+            expected[1] = original[3]
+            self.assertEqual(state.cpu(), expected)
+        self.assertEqual(
+            accepted.cpu(), torch.tensor([77, 88, 1], dtype=torch.int32)
+        )
+
 
 if __name__ == "__main__":
     run_tests()
