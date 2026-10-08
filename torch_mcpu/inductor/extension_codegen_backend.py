@@ -80,10 +80,8 @@ _MCPU_HOST_LOOP_FALLBACK_OPS = frozenset(
         torch.ops.aten.fill.Scalar,
         torch.ops.aten.fill.Tensor,
         torch.ops.aten.full.default,
-        torch.ops.aten.full.names,
         torch.ops.aten.full_like.default,
         torch.ops.aten.ones.default,
-        torch.ops.aten.ones.names,
         torch.ops.aten.ones_like.default,
         torch.ops.aten.cat.default,
         # Padding is a data-moving compute op even though its schema is not
@@ -93,7 +91,6 @@ _MCPU_HOST_LOOP_FALLBACK_OPS = frozenset(
         torch.ops.aten.constant_pad_nd.default,
         torch.ops.aten.zero.default,
         torch.ops.aten.zeros.default,
-        torch.ops.aten.zeros.names,
         torch.ops.aten.zeros_like.default,
     }
 )
