@@ -352,19 +352,26 @@ class McpuCppWrapperCodegen(cpp_wrapper_cpu.CppWrapperCpu):
         return super().val_to_arg_str_for_prim_type(val, type_)
 
     @staticmethod
-    def get_device_include_path(device: str) -> str:
+    def _get_mcpu_include_path(header_dir: str) -> str:
         include_dir = Path(get_include())
-        header = include_dir / "cpp_wrapper" / "mcpu.h"
+        header = include_dir / header_dir / "mcpu.h"
 
         if not header.exists():
             raise FileNotFoundError(f"Failed to find header file: {header}")
 
         return f'#include "{header}"'
 
-        # mcpu is CPU-backed; reuse the CPU wrapper header
-        # if device == "mcpu":
-        #     device = "cpu"
-        # return cpp_wrapper_cpu.CppWrapperCpu.get_device_include_path(device)
+    @staticmethod
+    def get_device_include_path_jit(device: str) -> str:
+        if device not in {"mcpu", "privateuseone"}:
+            return cpp_wrapper_cpu.CppWrapperCpu.get_device_include_path_jit(device)
+        return McpuCppWrapperCodegen._get_mcpu_include_path("cpp_wrapper")
+
+    @staticmethod
+    def get_device_include_path_aot(device: str) -> str:
+        if device not in {"mcpu", "privateuseone"}:
+            return cpp_wrapper_cpu.CppWrapperCpu.get_device_include_path_aot(device)
+        return McpuCppWrapperCodegen._get_mcpu_include_path("aoti_include")
 
 
 class McpuScheduling(BaseScheduling):

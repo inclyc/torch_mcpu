@@ -111,10 +111,13 @@ class TestMcpuInductorRegistration(unittest.TestCase):
         with patch.dict(
             os.environ, {"AOTI_EXTRA_CFLAGS": original_flags}, clear=False
         ):
-            include = codegen.get_device_include_path("mcpu")
-            self.assertEqual(os.environ["AOTI_EXTRA_CFLAGS"], original_flags)
-
-        self.assertIn(str(Path(get_include()) / "cpp_wrapper" / "mcpu.h"), include)
+            for mode, header_dir in (("jit", "cpp_wrapper"), ("aot", "aoti_include")):
+                with self.subTest(mode=mode):
+                    include = getattr(codegen, f"get_device_include_path_{mode}")("mcpu")
+                    self.assertEqual(os.environ["AOTI_EXTRA_CFLAGS"], original_flags)
+                    self.assertIn(
+                        str(Path(get_include()) / header_dir / "mcpu.h"), include
+                    )
 
     def test_sync_kernel_launch_definition_is_exported(self):
         definitions = get_compile_definitions()
