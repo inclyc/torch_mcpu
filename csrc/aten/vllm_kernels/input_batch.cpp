@@ -24,7 +24,7 @@ namespace {
 // ---------------------------------------------------------------------------
 void vllm_prepare_prefill_inputs_impl(
     at::Tensor& input_ids, // [max_num_tokens], int32
-    at::Tensor& next_prefill_tokens, // [max_num_reqs], int32
+    at::Tensor& next_prefill_tokens, // [num_lookahead, max_num_reqs], int32
     const at::Tensor& idx_mapping, // [num_reqs], int32
     const at::Tensor& query_start_loc, // [num_reqs+1], int32
     const at::Tensor& all_token_ids, // [max_num_reqs, max_seq_len], int32
@@ -33,6 +33,11 @@ void vllm_prepare_prefill_inputs_impl(
 
   int64_t num_reqs = idx_mapping.size(0);
   int64_t atids_stride = all_token_ids.stride(0);
+  const bool legacy_next_tokens = next_prefill_tokens.dim() == 1;
+  const int64_t num_lookahead =
+      legacy_next_tokens ? 1 : next_prefill_tokens.size(0);
+  const int64_t next_tokens_stride =
+      legacy_next_tokens ? 0 : next_prefill_tokens.stride(0);
 
   int32_t* iids_ptr = input_ids.data_ptr<int32_t>();
   int32_t* npt_ptr = next_prefill_tokens.data_ptr<int32_t>();
@@ -46,6 +51,9 @@ void vllm_prepare_prefill_inputs_impl(
       "mcpu::vllm_prepare_prefill_inputs",
       [num_reqs,
        atids_stride,
+       legacy_next_tokens,
+       num_lookahead,
+       next_tokens_stride,
        iids_ptr,
        npt_ptr,
        idx_ptr,
@@ -78,9 +86,12 @@ void vllm_prepare_prefill_inputs_impl(
           for (int32_t i = 0; i < qlen; i++) {
             iids_ptr[qstart + i] = req_tids[ncomp + i];
           }
-          int32_t next_pos = ncomp + qlen;
-          if (next_pos < plen) {
-            npt_ptr[req] = req_tids[next_pos];
+          for (int64_t lookahead = 0; lookahead < num_lookahead; ++lookahead) {
+            const int64_t next_pos = ncomp + qlen + lookahead;
+            if (next_pos < plen || !legacy_next_tokens) {
+              npt_ptr[lookahead * next_tokens_stride + req] =
+                  next_pos < plen ? req_tids[next_pos] : 0;
+            }
           }
         }
       });

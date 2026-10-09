@@ -8,6 +8,35 @@ from torch.testing._internal.common_utils import TestCase, run_tests
 
 
 class TestVllmKernelLaunch(TestCase):
+    def test_prepare_prefill_inputs_lookahead_and_legacy_layout(self):
+        def tensor(values):
+            return torch.tensor(values, dtype=torch.int32, device="mcpu")
+
+        for legacy in (False, True):
+            inputs = tensor([-99] * 5)
+            # Request 2 is decoding; request 1 finishes prefill; request 0
+            # has one prompt token left. The 2D output has a padded row stride.
+            next_tokens = (
+                tensor([-99] * 3) if legacy else tensor([[-99] * 5] * 3)[:, :3]
+            )
+            torch.ops.mcpu.vllm_prepare_prefill_inputs(
+                inputs, next_tokens, tensor([2, 0, 1]), tensor([0, 1, 3, 5]),
+                tensor([[10, 11, 12, 13, 14], [20, 21, 22, 23, 24],
+                        [30, 31, 32, 33, 34]]),
+                tensor([4, 3, 2]), tensor([1, 1, 2]),
+            )
+            torch.mcpu.synchronize()
+            self.assertEqual(
+                inputs.cpu(), torch.tensor([-99, 11, 12, 21, 22], dtype=torch.int32)
+            )
+            expected = (
+                [13, -99, -99] if legacy else
+                [[13, 0, -99], [0, 0, -99], [0, 0, -99]]
+            )
+            self.assertEqual(
+                next_tokens.cpu(), torch.tensor(expected, dtype=torch.int32)
+            )
+
     def test_dflash2_selector_walk_greedy_and_invalid_request(self):
         scores = torch.full(
             (2, 3, 3, 3), -10.0, dtype=torch.float32, device="mcpu"
@@ -792,7 +821,9 @@ class TestVllmKernelLaunch(TestCase):
         )
 
         torch.ops.mcpu.vllm_apply_grammar_bitmask(
-            logits_mcpu, logits_indices, bitmask, 35
+            logits_mcpu, logits_indices,
+            torch.tensor([0, 1, 2], dtype=torch.int32, device="mcpu"),
+            bitmask, 35, 1,
         )
         torch.mcpu.synchronize()
 
@@ -810,13 +841,85 @@ class TestVllmKernelLaunch(TestCase):
         )
 
         torch.ops.mcpu.vllm_apply_grammar_bitmask(
-            logits, logits_indices, bitmask, 32
+            logits, logits_indices,
+            torch.tensor([0, 1], dtype=torch.int32, device="mcpu"),
+            bitmask, 32, 1,
         )
         torch.mcpu.synchronize()
 
         expected = torch.zeros(32, dtype=torch.bfloat16)
         expected[31] = float("-inf")
         self.assertEqual(logits.cpu()[0], expected)
+
+    def test_apply_grammar_bitmask_compacted_mapping_differential(self):
+        # Reordered requests, a subset of positions, two empty requests, and
+        # inactive scheduled positions (including one past the last logits row).
+        mapping = [8, 0, 1, 3, 4, 5, 12, 14, 15, 16, 19]
+        offsets = [0, 2, 2, 3, 6, 6]
+        mask_stride = 4
+        generator = torch.Generator().manual_seed(1729)
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            for vocab in (1, 31, 32, 33, 8193):
+                with self.subTest(dtype=dtype, vocab=vocab):
+                    words = (vocab + 31) // 32
+                    original = torch.randn(8, vocab + 6, generator=generator).to(dtype)
+                    expected = original.clone()
+                    masks = torch.randint(
+                        -(2**31), 2**31, (len(mapping) + 2, words + 3),
+                        dtype=torch.int32, generator=generator,
+                    )
+                    # Explicit all-allow/all-deny cases supplement random words.
+                    masks[1, 1:words + 1] = -1
+                    masks[2, 1:words + 1] = 0
+                    for mask_row, encoded in enumerate(mapping):
+                        req, position = divmod(encoded, mask_stride)
+                        if position >= offsets[req + 1] - offsets[req]:
+                            continue
+                        for token in range(vocab):
+                            if not ((int(masks[mask_row + 1, token // 32 + 1])
+                                     >> (token % 32)) & 1):
+                                expected[1 + offsets[req] + position, 2 + token] = -math.inf
+                    storage = original.to("mcpu")
+                    mask_storage = masks.to("mcpu")
+                    indices = torch.tensor(mapping, dtype=torch.int32, device="mcpu")
+                    cu = torch.tensor(offsets, dtype=torch.int32, device="mcpu")
+                    # Nonzero storage offsets and padded strides on both matrices.
+                    torch.ops.mcpu.vllm_apply_grammar_bitmask(
+                        storage[1:7, 2:vocab + 4], indices, cu,
+                        mask_storage[1:-1, 1:words + 1], vocab, mask_stride,
+                    )
+                    torch.mcpu.synchronize()
+                    self.assertEqual(storage.cpu(), expected, atol=0, rtol=0)
+                    self.assertEqual(mask_storage.cpu(), masks)
+                    self.assertEqual(indices.cpu().tolist(), mapping)
+                    self.assertEqual(cu.cpu().tolist(), offsets)
+
+    def test_apply_grammar_bitmask_empty_and_cross_stream_offsets(self):
+        def ints(data):
+            return torch.tensor(data, dtype=torch.int32, device="mcpu")
+
+        logits = torch.full((2, 35), 7.0, device="mcpu")
+        torch.ops.mcpu.vllm_apply_grammar_bitmask(
+            logits, ints([]), ints([0]), ints([]).reshape(0, 1), 0, 1,
+        )
+        # No vocabulary is also a no-op for a nonempty mapping.
+        torch.ops.mcpu.vllm_apply_grammar_bitmask(
+            logits, ints([0]), ints([0, 2]), ints([[0, 0]]), 0, 2,
+        )
+        torch.mcpu.synchronize()
+        self.assertEqual(logits.cpu(), torch.full((2, 35), 7.0))
+        copy_stream, compute_stream = torch.mcpu.Stream(), torch.mcpu.Stream()
+        cu, indices, masks = ints([0, 0, 0]), ints([2, 3]), ints([[0, 0], [-1, -1]])
+        copy_stream.wait_stream(torch.mcpu.current_stream())
+        with torch.mcpu.stream(copy_stream):
+            cu.copy_(torch.tensor([0, 1, 2], dtype=torch.int32), non_blocking=True)
+        compute_stream.wait_stream(copy_stream)
+        with torch.mcpu.stream(compute_stream):
+            torch.ops.mcpu.vllm_apply_grammar_bitmask(logits, indices, cu, masks, 35, 2)
+        compute_stream.synchronize()
+        expected = torch.full((2, 35), 7.0)
+        expected[1] = -math.inf
+        self.assertEqual(logits.cpu(), expected)
 
     def test_logit_bias_preserves_all_allowed_tokens(self):
         vocab_size = 1100
@@ -1398,6 +1501,40 @@ class TestVllmKernelLaunch(TestCase):
             slots.cpu()[0],
             torch.tensor([-1, 40, -1, 41, -1, 42, -1, 43], dtype=torch.int64),
         )
+
+    def test_compute_slot_mappings_group_options_and_dummy_requests(self):
+        # KV blocks contain two kernel blocks. Group 0 is sharded, group 1
+        # is replicated and group 2 has slot mapping disabled.
+        table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32, device="mcpu")
+
+        def tensor(values, dtype):
+            return torch.tensor(values, dtype=dtype, device="mcpu")
+
+        for cp_size in (1, 2):
+            slots = torch.full((3, 12), 999, dtype=torch.int64, device="mcpu")
+            torch.ops.mcpu.vllm_compute_slot_mappings_kernel(
+                12,
+                tensor([0, -1], torch.int32),
+                tensor([0, 8, 10], torch.int32),
+                tensor(list(range(8)) + [0, 1000], torch.int64),
+                tensor([table.data_ptr()] * 3, torch.uint64),
+                tensor([4] * 3, torch.int64),
+                tensor([4] * 3, torch.int32),
+                slots, slots.stride(0), cp_size - 1, cp_size, 1, -1, 3, 2,
+                tensor([2] * 3, torch.int32),
+                tensor([True, True, False], torch.bool),
+                tensor([True, False, True], torch.bool),
+            )
+            torch.mcpu.synchronize()
+            replicated = list(range(20, 28)) + [-1] * 4
+            sharded = (
+                [-1, 20, -1, 21, -1, 22, -1, 23] + [-1] * 4
+                if cp_size == 2 else replicated
+            )
+            self.assertEqual(
+                slots.cpu(),
+                torch.tensor([sharded, replicated, [-1] * 12], dtype=torch.int64),
+            )
 
     def test_compute_slot_mapping_v1_abi_context_parallel_and_tail_padding(self):
         block_table = torch.tensor(

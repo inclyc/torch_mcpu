@@ -142,7 +142,10 @@ void vllm_compute_slot_mappings_kernel_impl(
     int64_t cp_interleave,
     int64_t pad_id,
     int64_t num_groups,
-    int64_t num_reqs) {
+    int64_t num_reqs,
+    const std::optional<at::Tensor>& kernel_block_sizes,
+    const std::optional<at::Tensor>& slot_mapping_enabled,
+    const std::optional<at::Tensor>& dcp_sharded) {
   VLLM_MCPU_CHECK_DTYPE(idx_mapping, at::kInt, "idx_mapping");
   VLLM_MCPU_CHECK_DTYPE(query_start_loc, at::kInt, "query_start_loc");
   VLLM_MCPU_CHECK_DTYPE(positions, at::kLong, "positions");
@@ -208,6 +211,14 @@ void vllm_compute_slot_mappings_kernel_impl(
   const uint64_t* table_ptrs = block_table_ptrs.data_ptr<uint64_t>();
   const int64_t* table_strides = block_table_strides.data_ptr<int64_t>();
   const int32_t* sizes_ptr = block_sizes.data_ptr<int32_t>();
+  const int32_t* kernel_sizes_ptr = kernel_block_sizes.has_value()
+      ? kernel_block_sizes->data_ptr<int32_t>()
+      : sizes_ptr;
+  const bool* enabled_ptr = slot_mapping_enabled.has_value()
+      ? slot_mapping_enabled->data_ptr<bool>()
+      : nullptr;
+  const bool* sharded_ptr =
+      dcp_sharded.has_value() ? dcp_sharded->data_ptr<bool>() : nullptr;
   int64_t* slots_ptr = slot_mappings.data_ptr<int64_t>();
   const int64_t positions_numel = positions.numel();
 
@@ -220,6 +231,9 @@ void vllm_compute_slot_mappings_kernel_impl(
        table_ptrs,
        table_strides,
        sizes_ptr,
+       kernel_sizes_ptr,
+       enabled_ptr,
+       sharded_ptr,
        slots_ptr,
        slot_mappings_stride,
        cp_rank,
@@ -249,6 +263,9 @@ void vllm_compute_slot_mappings_kernel_impl(
               reinterpret_cast<const int32_t*>(table_ptrs[group_id]);
           const int64_t table_stride = table_strides[group_id];
           const int64_t block_size = sizes_ptr[group_id];
+          const int64_t kernel_block_size = kernel_sizes_ptr[group_id];
+          const bool enabled = enabled_ptr == nullptr || enabled_ptr[group_id];
+          const bool sharded = sharded_ptr == nullptr || sharded_ptr[group_id];
           VLLM_MCPU_CHECK(
               table_stride > 0, "block table strides must be positive");
           VLLM_MCPU_CHECK(block_size > 0, "block sizes must be positive");
@@ -259,36 +276,40 @@ void vllm_compute_slot_mappings_kernel_impl(
 
           for (int64_t batch_idx = 0; batch_idx < num_reqs; ++batch_idx) {
             const int32_t req_idx = idx_ptr[batch_idx];
-            VLLM_MCPU_CHECK(
-                req_idx >= 0,
-                "idx_mapping must contain non-negative request indices");
             const int32_t start = query_ptr[batch_idx];
             const int32_t end = query_ptr[batch_idx + 1];
             VLLM_MCPU_CHECK(
                 0 <= start && start <= end && end <= actual_num_tokens,
                 "query_start_loc must be non-decreasing and within bounds");
+            if (req_idx < 0 || !enabled) {
+              for (int32_t token_idx = start; token_idx < end; ++token_idx)
+                slots[token_idx] = pad_id;
+              continue;
+            }
             const int32_t* req_table = table + req_idx * table_stride;
             for (int32_t token_idx = start; token_idx < end; ++token_idx) {
               const int64_t position = positions_ptr[token_idx];
               VLLM_MCPU_CHECK(position >= 0, "positions must be non-negative");
-              const int64_t global_block_size = block_size * cp_size;
-              const int64_t block_idx = position / global_block_size;
+              int64_t local_position = position;
+              if (cp_size != 1 && sharded) {
+                const int64_t global_block_size = block_size * cp_size;
+                const int64_t block_offset = position % global_block_size;
+                if ((block_offset / cp_interleave) % cp_size != cp_rank) {
+                  slots[token_idx] = pad_id;
+                  continue;
+                }
+                const int64_t rounds = block_offset / (cp_interleave * cp_size);
+                const int64_t remainder = block_offset % cp_interleave;
+                local_position = (position / global_block_size) * block_size +
+                    rounds * cp_interleave + remainder;
+              }
+              const int64_t block_idx = local_position / kernel_block_size;
               VLLM_MCPU_CHECK(
                   block_idx < table_stride,
                   "position maps outside the block table stride");
-              const int64_t block_offset = position % global_block_size;
               const int64_t block_number = req_table[block_idx];
-              if (cp_size == 1) {
-                slots[token_idx] = block_number * block_size + block_offset;
-                continue;
-              }
-              const bool is_local =
-                  (block_offset / cp_interleave) % cp_size == cp_rank;
-              const int64_t rounds = block_offset / (cp_interleave * cp_size);
-              const int64_t remainder = block_offset % cp_interleave;
-              const int64_t local_offset = rounds * cp_interleave + remainder;
-              slots[token_idx] =
-                  is_local ? block_number * block_size + local_offset : pad_id;
+              slots[token_idx] = block_number * kernel_block_size +
+                  local_position % kernel_block_size;
             }
           }
           for (int64_t token_idx = actual_num_tokens;
@@ -490,7 +511,10 @@ TORCH_LIBRARY_FRAGMENT(mcpu, m) {
       "int cp_interleave, "
       "int pad_id, "
       "int num_groups, "
-      "int num_reqs"
+      "int num_reqs, "
+      "Tensor? kernel_block_sizes=None, "
+      "Tensor? slot_mapping_enabled=None, "
+      "Tensor? dcp_sharded=None"
       ") -> ()");
   // vllm/vllm/v1/worker/block_table.py
   m.def(
