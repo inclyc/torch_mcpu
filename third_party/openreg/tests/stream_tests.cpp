@@ -58,6 +58,27 @@ TEST_F(StreamTest, StreamCreateNullptr) {
   EXPECT_EQ(orStreamCreate(nullptr), orErrorUnknown);
 }
 
+TEST_F(StreamTest, BlockingWorkerRepeatedIdleWakeup) {
+  orStream_t stream = nullptr;
+  ASSERT_EQ(orStreamCreateWithPriority(&stream, 0, 1), orSuccess);
+  for (int i = 0; i < 10000; ++i) {
+    ASSERT_EQ(orLaunchKernel(stream, [] {}), orSuccess);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!stream->idle() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    const bool completed = stream->idle();
+    EXPECT_TRUE(completed) << "published task lost its wakeup at iteration " << i;
+    if (!completed) {
+      // Rescue a failed test so teardown does not wait forever on the worker.
+      stream->wake_cv.notify_one();
+      break;
+    }
+    if (i % 2 == 0) std::this_thread::yield();
+  }
+  EXPECT_EQ(orStreamDestroy(stream), orSuccess);
+}
+
 TEST_F(StreamTest, StreamCreateWithInvalidPriority) {
   orStream_t stream = nullptr;
   int least_priority, greatest_priority;
