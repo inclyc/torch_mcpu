@@ -58,6 +58,69 @@ class TestKernelLaunchProtection(TestCase):
         stream.synchronize()
         self.assertTrue(torch.equal(x.cpu(), torch.full((8,), 23, dtype=torch.int64)))
 
+    def test_stream_condition_skips_tasks_and_releases_payloads(self):
+        selector = torch.empty(1, dtype=torch.int64, device="mcpu")
+        stream = torch.Stream(device="mcpu:0")
+        torch.mcpu.synchronize()
+        torch.mcpu.reset_kernel_timing()
+        torch.mcpu.set_kernel_timing_enabled(True)
+        try:
+            with stream:
+                counts = torch.ops.mcpu.kernel_launch_condition_counts(selector)
+        finally:
+            torch.mcpu.set_kernel_timing_enabled(False)
+        # Four rounds, two payloads each, half active; then one unconditional task.
+        self.assertEqual(counts, (8, 8, 5))
+        events = [
+            e
+            for thread in torch.mcpu.get_kernel_timing()
+            for e in thread["events"]
+            if e["name"] == "mcpu::conditional_large_test"
+        ]
+        self.assertEqual(len(events), 4)
+        self.assertEqual(sum(e["end_time"] > e["begin_time"] > 0 for e in events), 2)
+
+    def test_invocation_condition_lifetime_and_failed_submission(self):
+        if torch_mcpu.get_compile_definitions().get("TORCH_MCPU_ENABLE_SYNC_KERNEL_LAUNCH") == "1":
+            self.skipTest("the lifetime probe intentionally blocks an asynchronous worker")
+        selector = torch.empty(1, dtype=torch.int64, device="mcpu")
+        stream = torch.Stream(device="mcpu:0")
+        for enabled in (False, True):
+            for fail_submission in (False, True):
+                with self.subTest(enabled=enabled, fail_submission=fail_submission):
+                    with stream:
+                        counts = torch.ops.mcpu.kernel_launch_condition_lifetime_counts(
+                            selector, enabled, fail_submission
+                        )
+                    # One owner survives submission and is released even when all
+                    # guarded work is skipped or queue construction throws.
+                    self.assertEqual(counts, (1, 33 if enabled else 1, 1))
+
+    def test_parallel_conditions_profiler_and_stream_priorities(self):
+        selector = torch.empty(1, dtype=torch.int64, device="mcpu")
+        launches = 2048
+        torch.mcpu.synchronize()
+        torch.mcpu.reset_kernel_timing()
+        torch.mcpu.set_kernel_timing_enabled(True)
+        try:
+            counts = torch.ops.mcpu.kernel_launch_parallel_condition_counts(selector, launches)
+        finally:
+            torch.mcpu.synchronize()
+            torch.mcpu.set_kernel_timing_enabled(False)
+        self.assertEqual(counts, (2 * launches, 4))
+        events = [
+            e for thread in torch.mcpu.get_kernel_timing() for e in thread["events"]
+            if e["name"] == "mcpu::parallel_condition_test"
+        ]
+        # Each priority has one active and one skipped condition on separate
+        # host threads. Every reservation must be unique, including skipped work.
+        self.assertEqual(len(events), 4 * launches)
+        streams = {e["stream"] for e in events}
+        self.assertEqual(len(streams), 4)
+        for stream in streams:
+            self.assertEqual(sum(e["stream"] == stream for e in events), launches)
+        self.assertEqual(sum(e["end_time"] > e["begin_time"] > 0 for e in events), 2 * launches)
+
     def test_move_only_launch_payload_is_destroyed(self):
         stream = torch.Stream(device="mcpu:0")
         selector = torch.empty(1, dtype=torch.int64, device="mcpu")

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <optional>
 #include <type_traits>
 #include <unordered_set>
@@ -216,8 +217,98 @@ class KernelMemoryGuard {
 };
 #endif
 
+// A stream-produced flag can guard a batch of kernel submissions without a
+// host readback. Only the stream worker may read/write the flag after
+// submission. KernelLaunchLifetimeScope retains storage through the last
+// submitted task.
+struct KernelLaunchCondition {
+  orStream_t stream = nullptr;
+  const bool* enabled = nullptr;
+};
+
+namespace detail {
+MCPU_KERNEL_LAUNCH_EXPORT const KernelLaunchCondition&
+kernel_launch_condition() noexcept;
+
+// Predication adds a borrowed pointer to the closure. Keep tasks inline;
+// spill only a conditional closure that no longer fits the runtime queue slot.
+template <typename Func>
+inline orError_t queue_conditional_task(orStream_t stream, Func&& func) {
+  using Task = openreg::TupleTask<std::decay_t<Func>>;
+  if constexpr (
+      sizeof(Task) <= sizeof(openreg::QueueSlot::storage) &&
+      alignof(Task) <= openreg::kQueueSlotStorageAlignment) {
+    return orLaunchKernel(stream, std::forward<Func>(func));
+  } else {
+    auto owned = std::make_unique<std::decay_t<Func>>(std::forward<Func>(func));
+    return orLaunchKernel(
+        stream, [owned = std::move(owned)]() mutable { std::invoke(*owned); });
+  }
+}
+} // namespace detail
+
+// One owner per invocation, released by an unconditional task on the captured
+// stream. Declare before submitting any task that borrows from owner, and keep
+// alive until all such submissions (and condition scopes) have finished.
+// Like other stream APIs, the stream must outlive the submitting scope.
+class MCPU_KERNEL_LAUNCH_EXPORT KernelLaunchLifetimeScope {
+ public:
+  explicit KernelLaunchLifetimeScope(std::shared_ptr<const void> owner = {});
+  ~KernelLaunchLifetimeScope() noexcept;
+  KernelLaunchLifetimeScope(const KernelLaunchLifetimeScope&) = delete;
+  KernelLaunchLifetimeScope& operator=(const KernelLaunchLifetimeScope&) =
+      delete;
+
+ private:
+  friend class KernelLaunchConditionScope;
+  orStream_t stream_ = nullptr;
+  std::shared_ptr<const void> owner_;
+};
+
+// Scope applies to launches on the calling thread, and only on its current
+// stream. An empty flag preserves an outer scope. Nonempty nesting is rejected
+// rather than silently discarding an outer condition. No task capture/replay.
+class MCPU_KERNEL_LAUNCH_EXPORT KernelLaunchConditionScope {
+ public:
+  // Convenience overload: retains once per condition scope, not per task.
+  explicit KernelLaunchConditionScope(std::shared_ptr<const bool> enabled);
+  // Reuse one lifetime across multiple condition scopes in an invocation.
+  // enabled must point into storage kept alive by lifetime's owner.
+  KernelLaunchConditionScope(
+      const KernelLaunchLifetimeScope& lifetime,
+      const bool* enabled);
+  ~KernelLaunchConditionScope();
+  KernelLaunchConditionScope(const KernelLaunchConditionScope&) = delete;
+  KernelLaunchConditionScope& operator=(const KernelLaunchConditionScope&) =
+      delete;
+
+ private:
+  KernelLaunchLifetimeScope owned_lifetime_;
+  bool owns_condition_ = false;
+};
+
 template <typename Func>
 inline void launch_kernel_on_stream(orStream_t stream, Func&& func) {
+  const auto& condition = detail::kernel_launch_condition();
+  if (condition.enabled) {
+    TORCH_CHECK(
+        stream == condition.stream,
+        "conditional kernel launch must use its condition's stream");
+    auto status = detail::queue_conditional_task(
+        stream,
+        [enabled = condition.enabled,
+         func = std::forward<Func>(func)]() mutable {
+          if (!*enabled)
+            return;
+          KernelTaskScope kernel_task;
+          std::invoke(func);
+        });
+    TORCH_CHECK(status == orSuccess, "orLaunchKernel failed");
+#if TORCH_MCPU_ENABLE_SYNC_KERNEL_LAUNCH
+    detail::synchronize_kernel_launch_stream(stream);
+#endif
+    return;
+  }
 #if TORCH_MCPU_ENABLE_MEMORY_PROTECTION
   auto status =
       orLaunchKernel(stream, [func = std::forward<Func>(func)]() mutable {
@@ -252,6 +343,31 @@ inline void launch_timed_kernel_on_stream(
   auto* event_slot = kernel_timing::reserve_event_slot(
       record_name,
       static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(stream)));
+  const auto& condition = detail::kernel_launch_condition();
+  if (condition.enabled) {
+    TORCH_CHECK(
+        stream == condition.stream,
+        "conditional kernel launch must use its condition's stream");
+    // Reserve on the submitter, as for ordinary launches, so event ordering and
+    // reservation capacity follow submissions even when tasks are skipped.
+    // Skipped slots retain zero timestamps and are excluded from profiler
+    // output.
+    auto status = detail::queue_conditional_task(
+        stream,
+        [enabled = condition.enabled,
+         event_slot,
+         func = std::forward<Func>(func)]() mutable {
+          if (!*enabled)
+            return;
+          KernelTaskScope kernel_task;
+          std::invoke(func, event_slot);
+        });
+    TORCH_CHECK(status == orSuccess, "orLaunchKernel failed");
+#if TORCH_MCPU_ENABLE_SYNC_KERNEL_LAUNCH
+    detail::synchronize_kernel_launch_stream(stream);
+#endif
+    return;
+  }
 #if TORCH_MCPU_ENABLE_MEMORY_PROTECTION
   auto status = orLaunchKernel(
       stream, [event_slot, func = std::forward<Func>(func)]() mutable {
