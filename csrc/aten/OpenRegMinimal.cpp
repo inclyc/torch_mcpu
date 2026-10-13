@@ -4,6 +4,7 @@
 
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/core/stack.h>
+#include <ATen/ops/copy_native.h>
 
 #if TORCH_MCPU_ENABLE_CPU_FALLBACK
 #include <ATen/native/CPUFallback.h>
@@ -65,6 +66,27 @@ at::Tensor wrapper__reshape_alias(
     c10::SymIntArrayRef size,
     c10::SymIntArrayRef stride) {
   return at::native::mcpu::_reshape_alias(self, size, stride);
+}
+
+at::Tensor& wrapper_copy_(
+    at::Tensor& dst,
+    const at::Tensor& src,
+    bool non_blocking) {
+  // Native copy_ handles identity before dispatching _copy_from, so a lazy
+  // view copied to itself cannot enter the math-bit fallback recursively.
+  if (dst.is_same(src)) {
+    return at::native::copy_(dst, src, non_blocking);
+  }
+  // copy_ falls through Negative/Conjugate dispatch. Reject unsupported lazy
+  // views before _copy_from's math-bit fallback clones them and re-enters
+  // copy_. CPU sources can be cloned safely by that fallback; PrivateUse1
+  // dispatch also covers CPU-to-MCPU copies and must keep accepting them.
+  TORCH_CHECK(
+      (src.is_cpu() || (!src.is_neg() && !src.is_conj())) && !dst.is_neg() &&
+          !dst.is_conj(),
+      "mcpu::copy_: lazy negative/conjugate views are unsupported");
+  // Call the native function directly; redispatching copy_ would recurse.
+  return at::native::copy_(dst, src, non_blocking);
 }
 
 at::Tensor wrapper__copy_from(
@@ -153,6 +175,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("as_strided", wrapper_as_strided);
   m.impl("resize_", wrapper_resize_);
   m.impl("_reshape_alias", wrapper__reshape_alias);
+  m.impl("copy_", wrapper_copy_);
   m.impl("_copy_from", wrapper__copy_from);
   m.impl("_copy_from_and_resize", wrapper__copy_from_and_resize);
   m.impl("_local_scalar_dense", wrapper__local_scalar_densor);

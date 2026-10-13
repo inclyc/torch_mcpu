@@ -3,6 +3,9 @@
 import collections
 import functools
 import gc
+import subprocess
+import sys
+import textwrap
 import unittest
 
 import torch
@@ -49,6 +52,80 @@ class TestFactory(TestCase):
 
 
 class TestCopy(TestCase):
+    def test_copy_cpu_lazy_source(self):
+        original = torch.tensor([1 + 2j, 3 - 4j])
+        sources = (
+            (torch._neg_view(original), -original),
+            (original.conj(), torch.conj_physical(original)),
+            (torch._neg_view(original.conj()), -torch.conj_physical(original)),
+        )
+        for source, expected in sources:
+            for non_blocking in (False, True):
+                with self.subTest(
+                    neg=source.is_neg(),
+                    conj=source.is_conj(),
+                    non_blocking=non_blocking,
+                ):
+                    destination = torch.empty_like(original, device="mcpu")
+                    self.assertIs(
+                        destination.copy_(source, non_blocking=non_blocking),
+                        destination,
+                    )
+                    self.assertEqual(destination.cpu(), expected)
+                    self.assertEqual(
+                        source.to("mcpu", non_blocking=non_blocking).cpu(), expected
+                    )
+                    self.assertEqual(original, torch.tensor([1 + 2j, 3 - 4j]))
+
+    def test_copy_mcpu_lazy_identity_is_noop(self):
+        original = torch.tensor([1 + 2j, 3 - 4j])
+        base = original.to("mcpu")
+        for view in (torch._neg_view(base), base.conj(), torch._neg_view(base.conj())):
+            for non_blocking in (False, True):
+                with self.subTest(
+                    neg=view.is_neg(),
+                    conj=view.is_conj(),
+                    non_blocking=non_blocking,
+                ):
+                    bits = (view.is_neg(), view.is_conj())
+                    self.assertIs(view.copy_(view, non_blocking=non_blocking), view)
+                    self.assertEqual((view.is_neg(), view.is_conj()), bits)
+                    self.assertEqual(base.cpu(), original)
+
+    def test_copy_mcpu_lazy_views_fail_without_recursion(self):
+        # Keep a missing guard's stack overflow or hang out of the test runner.
+        code = textwrap.dedent("""
+            import torch
+            import torch_mcpu
+
+            base = torch.tensor([1 + 2j, 3 - 4j], device="mcpu")
+            views = (torch._neg_view(base), base.conj(), torch._neg_view(base.conj()))
+            for view in views:
+                for device in ("cpu", "mcpu"):
+                    plain = torch.empty(2, dtype=base.dtype, device=device)
+                    for src, dst in ((view, plain), (plain, view)):
+                        for non_blocking in (False, True):
+                            for copy in (
+                                lambda: dst.copy_(src, non_blocking=non_blocking),
+                                lambda: torch.ops.aten._copy_from(src, dst, non_blocking),
+                            ):
+                                try:
+                                    copy()
+                                except RuntimeError as error:
+                                    assert "lazy negative/conjugate views are unsupported" in str(error), str(error)
+                                else:
+                                    raise AssertionError("MCPU lazy copy unexpectedly succeeded")
+            torch.mcpu.synchronize()
+            torch.testing.assert_close(base.cpu(), torch.tensor([1 + 2j, 3 - 4j]))
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_copy_same_device(self):
         """Test copy operation on same device"""
         a = torch.ones(10, device="mcpu").clone()
@@ -94,6 +171,110 @@ class TestCopy(TestCase):
         base = torch.arange(6.0, device="mcpu")
         with self.assertRaisesRegex(RuntimeError, "single memory location"):
             base[1:].copy_(base[:-1])
+
+    def test_copy_broadcast_to_singleton_row_gap(self):
+        """Broadcast scalars must write every selected row, not adjacent columns."""
+        for dtype in (torch.float32, torch.bfloat16):
+            for source_device in ("cpu", "mcpu"):
+                with self.subTest(dtype=dtype, source_device=source_device):
+                    base = torch.full((1, 2, 1, 128), -19, dtype=dtype, device="mcpu")
+                    target = base[..., 0]
+                    source = torch.tensor(7, dtype=dtype, device=source_device)
+                    expanded = source.expand(target.shape)
+                    torch.ops.aten._copy_from(expanded, target, non_blocking=True)
+                    actual = base.cpu()
+                    expected = torch.full(actual.shape, -19, dtype=dtype)
+                    expected[..., 0] = 7
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(target.cpu(), expected[..., 0])
+
+    def test_copy_expanded_identity_and_empty_are_noops(self):
+        """Internal overlap is harmless for identical views and empty outputs."""
+        base = torch.tensor([[2.0, 7.0]], device="mcpu")
+        expanded = base.expand(3, 2)
+        identical_view = base.expand(3, 2)
+        for non_blocking in (False, True):
+            torch.ops.aten._copy_from(expanded, expanded, non_blocking=non_blocking)
+            torch.ops.aten._copy_from(
+                expanded, identical_view, non_blocking=non_blocking
+            )
+            empty = torch.empty(1, 0, device="mcpu").expand(3, 0)
+            source = torch.empty(3, 0, device="mcpu")
+            torch.ops.aten._copy_from(source, empty, non_blocking=non_blocking)
+            self.assertEqual(empty.cpu(), torch.empty(3, 0))
+        self.assertEqual(base.cpu(), torch.tensor([[2.0, 7.0]]))
+
+    @skipIfTorchDynamo("unsupported aten.is_pinned.default")
+    def test_copy_shared_pointer_facade_preserves_synchronization(self):
+        """A CPU/MCPU shared pointer still needs its pending writer to finish."""
+        host = torch.zeros(3, 5, pin_memory=True)
+        facade = torch.mcpu.get_mcpu_view_from_cpu_tensor(host)
+        self.assertEqual(host.data_ptr(), facade.data_ptr())
+        facade.fill_(13)
+        torch.ops.aten._copy_from(facade, host, non_blocking=False)
+        self.assertEqual(host, torch.full((3, 5), 13.0))
+        host.fill_(29)
+        torch.ops.aten._copy_from(host, facade, non_blocking=True)
+        torch.mcpu.synchronize()
+        self.assertEqual(facade.cpu(), torch.full((3, 5), 29.0))
+
+    def test_copy_singleton_row_gap_preserves_readonly_source(self):
+        """A trailing singleton does not make a strided source slice contiguous."""
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                original = torch.arange(6 * 16, dtype=torch.float32).reshape(3, 2, 1, 16)
+                original = original.to(dtype)
+                source_base = original.to("mcpu")
+                source = source_base[..., 0]
+                destination_base = torch.full(
+                    (3, 2, 1, 23), -17, dtype=dtype, device="mcpu"
+                )
+                destination = destination_base[..., 0]
+                torch.ops.aten._copy_from(source, destination, non_blocking=False)
+                expected = torch.full(destination_base.shape, -17, dtype=dtype)
+                expected[..., 0] = original[..., 0]
+                self.assertEqual(destination_base.cpu(), expected)
+                self.assertEqual(source_base.cpu(), original)
+                self.assertEqual(source.cpu(), original[..., 0])
+
+    def test_copy_trailing_singletons_with_arbitrary_strides(self):
+        """Size-one strides may be ignored only after proving dense active axes."""
+        original = torch.arange(6.0).reshape(2, 3)
+        source_base = original.to("mcpu")
+        source = source_base.as_strided((2, 3, 1, 1), (3, 1, 97, 53))
+        destination = torch.empty_like(source)
+        torch.ops.aten._copy_from(source, destination, non_blocking=False)
+        self.assertEqual(destination.cpu(), original.reshape(2, 3, 1, 1))
+
+    def test_copy_memcpy_fastpath_preserves_dense_rows_and_outer_broadcast(self):
+        """Keep legal memcpy blocks while rejecting singleton-gap coalescing."""
+        cpu_source = torch.arange(24.0).reshape(3, 8)
+        source_base = cpu_source.to("mcpu")
+        source = source_base[:, :5]
+        targets = [
+            torch.empty(3, 5, device="mcpu"),
+            torch.full((3, 9), -11, dtype=torch.float32, device="mcpu")[:, :5],
+            torch.empty(3, 5, device="mcpu"),
+        ]
+        sources = [source, source, source[:1].expand(3, 5)]
+        torch.mcpu.synchronize()
+        torch.mcpu.reset_kernel_timing()
+        torch.mcpu.set_kernel_timing_enabled(True)
+        try:
+            for src, target in zip(sources, targets):
+                torch.ops.aten._copy_from(src, target, non_blocking=False)
+            torch.ops.aten._copy_from(source_base, source_base, non_blocking=False)
+            torch.mcpu.synchronize()
+            timing = torch.mcpu.get_kernel_timing()
+        finally:
+            torch.mcpu.set_kernel_timing_enabled(False)
+            torch.mcpu.reset_kernel_timing()
+        for i, target in enumerate(targets):
+            expected = cpu_source[:, :5] if i < 2 else cpu_source[:1, :5].expand(3, 5)
+            self.assertEqual(target.cpu(), expected)
+        self.assertEqual(source_base.cpu(), cpu_source)
+        names = [event.get("name") for thread in timing for event in thread.get("events", [])]
+        self.assertEqual(names.count("mcpu::_copy_from.same_device.memcpy"), 3, names)
 
     def test_cross_device_copy(self):
         """Test copy operation across CPU and mcpu"""

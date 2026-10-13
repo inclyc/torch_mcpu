@@ -98,24 +98,22 @@ MemcpyCopyPlan make_memcpy_copy_plan(
     return plan;
   }
 
-  int64_t inner_start = ndim - 1;
-  while (inner_start > 0) {
-    const int64_t dim = inner_start - 1;
-    const int64_t next_dim = inner_start;
-    if (self.size(dim) <= 1 && dst.size(dim) <= 1) {
-      --inner_start;
-      continue;
-    }
-    if (self.stride(dim) != self.stride(next_dim) * self.size(next_dim) ||
-        dst.stride(dim) != dst.stride(next_dim) * dst.size(next_dim)) {
-      break;
-    }
-    --inner_start;
-  }
-
+  // Singleton axes have arbitrary strides. Establish the physical contiguous
+  // block from element stride one, rather than from a singleton's stride.
+  // A broadcast source axis must stay outside the memcpy block as well.
+  int64_t inner_start = ndim;
   int64_t inner_numel = 1;
-  for (int64_t dim = inner_start; dim < ndim; ++dim) {
-    inner_numel *= self.size(dim);
+  for (int64_t dim = ndim - 1; dim >= 0; --dim) {
+    if (self.size(dim) > 1) {
+      if (self.stride(dim) != inner_numel || dst.stride(dim) != inner_numel) {
+        break;
+      }
+      inner_numel *= self.size(dim);
+    }
+    inner_start = dim;
+  }
+  if (inner_numel == 1 && numel > 1) {
+    return plan;
   }
   plan.valid = true;
   plan.copy_bytes = static_cast<size_t>(inner_numel) * elem_size;
@@ -395,6 +393,28 @@ at::Tensor _copy_from(
     bool non_blocking) {
   TORCH_CHECK(self.defined(), "Source tensor (self) is not defined.");
   TORCH_CHECK(dst.defined(), "Destination tensor (dst) is not defined.");
+
+  if (self.is_same(dst)) {
+    return dst;
+  }
+  // Match copy_'s same-view no-op before validating writable destinations.
+  // Keep cross-device shared-pointer facades on their synchronization path.
+  if (self.device() == dst.device() && self.layout() == c10::Layout::Strided &&
+      dst.layout() == c10::Layout::Strided && self.is_alias_of(dst) &&
+      self.storage_offset() == dst.storage_offset() &&
+      self.strides() == dst.strides() && self.sizes() == dst.sizes() &&
+      self.scalar_type() == dst.scalar_type() &&
+      self.is_conj() == dst.is_conj() && self.is_neg() == dst.is_neg()) {
+    return dst;
+  }
+  // Fail on the host before an asynchronous worker can write overlapping rows
+  // or throw from the CPU-view fallback. Empty destinations perform no writes.
+  if (dst.numel() != 0) {
+    TORCH_CHECK(
+        !self.is_neg() && !self.is_conj() && !dst.is_neg() && !dst.is_conj(),
+        "mcpu::_copy_from: lazy negative/conjugate views are unsupported");
+    at::assert_no_internal_overlap(dst);
+  }
 
   if (is_mcpu_tensor(self) && is_mcpu_tensor(dst) &&
       self.device() == dst.device()) {
