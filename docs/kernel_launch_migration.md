@@ -88,6 +88,13 @@ kernel body in `{ ... }` for readability.
 For oversized argument lists, capture one owning args object instead of many
 values: `([args = std::move(args)])`.
 
+The queue provides 480 bytes of inline task storage. On the current 64-bit ABI,
+the complete slot occupies 512 bytes including metadata and padding. The limit
+applies to the complete queued task, including launch wrappers and arguments.
+Changing this layout requires rebuilding the runtime, external extensions, and
+cached compiled artifacts together; do not mix the previous 256-byte layout
+with the new one.
+
 ## Pointer-Capture Pattern
 
 Use this by default for hand-written kernels, including kernels under
@@ -206,3 +213,91 @@ pattern shown above:
 This keeps external kernel code close to the in-tree
 `torch_mcpu/csrc/aten/vllm_kernels` style while avoiding direct CPU access to
 MCPU storage outside the stream task.
+
+
+## Stream-produced launch conditions
+
+Use `at::mcpu::KernelLaunchConditionScope` when a fixed batch of kernels should
+execute only if a flag produced earlier on the same stream is true. The scope
+attaches a borrowed `const bool*` to both ordinary and timed kernel launches.
+The stream worker checks it before memory guards or kernel work. Timed launches
+reserve slots on the submitter, as before; skipped tasks leave zero timestamps
+and are excluded from completed profiler events.
+
+The caller must never read the flag to decide what to submit. Update it in a
+preceding unconditional stream task, outside the condition scope. Keep all flag
+reads and writes on that stream; the runtime rejects launches to another stream
+and rejects nonempty nested conditions. An empty scope preserves an existing
+condition. Scope destruction restores ordinary submission, including on exceptions.
+
+Use one `KernelLaunchLifetimeScope` to retain an invocation's state across all
+of its submissions. It enqueues an unconditional owner-retaining tail task on
+the stream captured at construction, including when host submission unwinds.
+Individual conditional tasks do not copy or release the owner:
+
+```cpp
+auto state = std::make_shared<InvocationState>();
+at::mcpu::KernelLaunchLifetimeScope lifetime(state);
+auto* raw = state.get();
+for (int round = 0; round < max_rounds; ++round) {
+  at::mcpu::launch_kernel([raw, round] {
+    raw->active = round < raw->actual_rounds;
+  });
+  at::mcpu::KernelLaunchConditionScope condition(lifetime, &raw->active);
+  existing_kernel_wrapper_a(...);
+  existing_kernel_wrapper_b(...);
+}
+```
+
+The lifetime scope must be created before any submission borrowing its state,
+and outlive every such submission and condition scope. The condition pointer
+must refer to storage kept alive by that owner. Keep the stream alive through
+scope destruction. Do not read/write the predicate from the host after publishing
+tasks, or borrow its storage on another stream. This changes ownership only;
+existing wrappers and their host-side metadata work remain in place.
+
+The convenience `KernelLaunchConditionScope(shared_ptr<const bool>)` overload
+retains once per condition scope and also uses an unconditional tail task. For
+multiple regions in one invocation, prefer the explicit lifetime overload above
+to avoid an extra cleanup task per region. An empty owner/condition is a no-op.
+
+If cleanup publication fails, the runtime retains its owner while synchronizing
+the captured stream. This is an exceptional fallback, not part of normal
+submission. If safe completion cannot be established (including a self-wait on
+the worker), it terminates rather than release storage still in use.
+Synchronous-launch builds also wait for the cleanup task before scope destruction
+returns. Waiting releases the Python GIL when held. Asynchronous builds retain
+their normal enqueue-only path.
+
+Skipped tasks still destroy their captures.
+Conditional closures that exceed the inline queue slot size use an owning heap
+closure, while fitting tasks retain inline submission. Ordinary launches keep
+the existing inline path. This mechanism neither captures nor replays kernels,
+and does not predicate arbitrary raw `orLaunchKernel` calls or host-side work.
+
+For collectives, every rank must agree the condition before entering guarded
+communication; local emptiness is insufficient. V5/V6 EP exchanges round counts
+in dispatch record headers on the stream and uses fixed configuration-derived
+submission bounds for this purpose.
+
+V5/V6 still use process-global MPI window contexts. Calls sharing a context must
+be ordered through their final reduction, using a single communication stream or
+explicit cross-stream dependencies with matching collective order on every rank.
+Invocation-local predicates do not make overlapping EP calls on those windows
+safe. Stream priorities select worker idle policies, not collective ordering or
+preemptive scheduling.
+
+Profiler reservations support concurrent host submitters. Skipped tasks retain
+zero timestamps and still consume reservation capacity (262,144 slots globally);
+they do not become completed trace events. Stop host submissions and drain streams
+before resetting or reading timing payloads. Atomic reservation does not make
+live reset/snapshot operations safe.
+
+V5/V6 EP retains its chunk plan once around the complete invocation and borrows
+`active_round` across all rounds. Rebuild external extensions after updating this
+header/runtime pair; the condition and scope layouts changed. Previously compiled
+JIT/Inductor artifacts using the old header must also be regenerated.
+
+For measured execution-sequence overhead with a supplied stream queue, ownership
+costs, and reproducible benchmarks, see
+[条件 kernel launch 的执行序列性能评估](kernel_launch_condition_performance.md).

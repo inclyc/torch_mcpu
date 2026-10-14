@@ -300,6 +300,9 @@ void orStream::notifyWorker() {
   if (idle_policy == IdlePolicy::Busy) {
     return;
   }
+  // Pair publication with the worker's predicate-check/wait transition. Without
+  // this lock, notification can be lost between that check and entering wait.
+  std::lock_guard<std::mutex> lock(wake_mutex);
   wake_cv.notify_one();
 }
 

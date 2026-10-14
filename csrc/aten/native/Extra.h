@@ -71,6 +71,15 @@ at::Tensor& stream_sleep_copy_(
     const at::Tensor& src,
     int64_t sleep_ms);
 int64_t first_element_int(const at::Tensor& x);
+std::tuple<int64_t, int64_t, int64_t> kernel_launch_condition_counts(
+    const at::Tensor& stream_selector);
+std::tuple<int64_t, int64_t, int64_t> kernel_launch_condition_lifetime_counts(
+    const at::Tensor& stream_selector,
+    bool enabled,
+    bool fail_submission);
+std::tuple<int64_t, int64_t> kernel_launch_parallel_condition_counts(
+    const at::Tensor& stream_selector,
+    int64_t launches);
 std::tuple<int64_t, int64_t, int64_t> kernel_launch_lifetime_counts(
     const at::Tensor& stream_selector,
     int64_t launches);

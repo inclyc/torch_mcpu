@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <memory>
+#include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace at::native::mcpu {
 
@@ -293,6 +296,216 @@ int64_t first_element_int(const at::Tensor& x) {
   check_stream_test_tensor(x);
   MemoryGuard guard(x);
   return x.data_ptr<int64_t>()[0];
+}
+
+// Runtime test probe: mutable stream predicates, skipped payload destruction,
+// large move-only closure spilling, and restoration of unconditional
+// submission.
+std::tuple<int64_t, int64_t, int64_t> kernel_launch_condition_counts(
+    const at::Tensor& selector) {
+  check_stream_test_tensor(selector);
+  g_lifetime_payload_constructed.store(0, std::memory_order_relaxed);
+  g_lifetime_payload_destroyed.store(0, std::memory_order_relaxed);
+  g_lifetime_payload_ran.store(0, std::memory_order_relaxed);
+  auto enabled = std::make_shared<bool>(false);
+  std::weak_ptr<bool> lifetime = enabled;
+  for (int i = 0; i < 4; ++i) {
+    at::mcpu::launch_kernel([enabled, i] { *enabled = i % 2 == 0; });
+    at::mcpu::KernelLaunchConditionScope condition(enabled);
+    if (i == 0) {
+      bool rejected_nested = false, rejected_stream = false;
+      try {
+        at::mcpu::KernelLaunchConditionScope nested(enabled);
+      } catch (const c10::Error&) {
+        rejected_nested = true;
+      }
+      try {
+        at::mcpu::launch_kernel_on_stream(
+            c10::mcpu::getStreamFromPool(), [] {});
+      } catch (const c10::Error&) {
+        rejected_stream = true;
+      }
+      TORCH_CHECK(
+          rejected_nested && rejected_stream,
+          "unsafe launch condition accepted");
+    }
+    at::mcpu::launch_kernel(
+        [payload = std::make_unique<KernelLaunchLifetimePayload>(i)] {
+          TORCH_CHECK(payload != nullptr);
+          g_lifetime_payload_ran.fetch_add(1, std::memory_order_relaxed);
+        });
+    // The ordinary timed closure fits exactly; adding the condition pointer
+    // must spill even when the queue's inline capacity changes.
+    constexpr size_t large_count =
+        (sizeof(openreg::QueueSlot::storage) - 32) / sizeof(int64_t);
+    std::array<int64_t, large_count> large{};
+    large.back() = i;
+    const int64_t extra = i + 1;
+    at::mcpu::launch_timed_kernel(
+        "mcpu::conditional_large_test",
+        [payload = std::make_unique<KernelLaunchLifetimePayload>(i),
+         large,
+         i,
+         extra](at::mcpu::kernel_timing::Event* event) {
+          MCPU_KERNEL_TIMING_SCOPE_EVENT("mcpu::conditional_large_test", event);
+          TORCH_CHECK(
+              payload != nullptr && large.back() == i && extra == i + 1);
+          g_lifetime_payload_ran.fetch_add(1, std::memory_order_relaxed);
+        });
+  }
+  at::mcpu::launch_kernel(
+      [] { g_lifetime_payload_ran.fetch_add(1, std::memory_order_relaxed); });
+  enabled.reset();
+  TORCH_CHECK(
+      orStreamSynchronize(c10::mcpu::getCurrentMcpuStream()) == orSuccess);
+  TORCH_CHECK(
+      lifetime.expired(),
+      "conditional launch retained the predicate after execution");
+  return {
+      g_lifetime_payload_constructed.load(),
+      g_lifetime_payload_destroyed.load(),
+      g_lifetime_payload_ran.load()};
+}
+
+std::tuple<int64_t, int64_t, int64_t> kernel_launch_condition_lifetime_counts(
+    const at::Tensor& selector,
+    bool enabled,
+    bool fail_submission) {
+  check_stream_test_tensor(selector);
+  const auto stream = c10::mcpu::getCurrentMcpuStream();
+  const auto other_stream = c10::mcpu::getStreamFromPool();
+  std::atomic<int64_t> destroyed{0}, ran{0};
+  std::atomic<bool> release{false};
+  struct State {
+    explicit State(std::atomic<int64_t>* count) : destroyed(count) {}
+    ~State() {
+      destroyed->fetch_add(1);
+    }
+    std::atomic<int64_t>* destroyed;
+    bool enabled = false;
+  };
+  auto state = std::make_shared<State>(&destroyed);
+  std::weak_ptr<State> weak = state;
+  auto* ptr = state.get();
+  // Even a failed assertion must unblock/drain tasks before their stack data
+  // dies.
+  struct Drain {
+    orStream_t stream;
+    std::atomic<bool>& release;
+    ~Drain() {
+      release.store(true);
+      (void)orStreamSynchronize(stream);
+    }
+  } drain{stream, release};
+  at::mcpu::launch_kernel([&release] {
+    while (!release.load())
+      std::this_thread::yield();
+  });
+  int64_t max_owners = 0;
+  bool caught = false;
+  try {
+    at::mcpu::KernelLaunchLifetimeScope lifetime(state);
+    state.reset();
+    // The invocation owner alone protects even the unconditional producer.
+    at::mcpu::launch_kernel([ptr, enabled] { ptr->enabled = enabled; });
+    {
+      at::mcpu::KernelLaunchConditionScope condition(lifetime, &ptr->enabled);
+      at::mcpu::KernelLaunchConditionScope empty(nullptr);
+      for (int i = 0; i < 32; ++i) {
+        at::mcpu::launch_kernel([&ran] { ran.fetch_add(1); });
+        max_owners = std::max<int64_t>(max_owners, weak.use_count());
+      }
+      TORCH_CHECK(
+          max_owners == 1, "conditional tasks acquired per-task owners");
+      if (fail_submission) {
+        struct ThrowOnMove {
+          ThrowOnMove() = default;
+          ThrowOnMove(ThrowOnMove&&) {
+            throw std::runtime_error("test enqueue failure");
+          }
+          void operator()() const {}
+        };
+        // Exercise a failed queue placement after a successfully submitted
+        // prefix.
+        const auto status = orLaunchKernel(stream, ThrowOnMove{});
+        TORCH_CHECK(status == orSuccess, "injected enqueue failure");
+      }
+    }
+    // The lifetime must retire on its original stream, not the current one.
+    c10::mcpu::setCurrentMcpuStream(other_stream);
+  } catch (const c10::Error& error) {
+    caught = std::string(error.what()).find("injected enqueue failure") !=
+        std::string::npos;
+    if (!caught)
+      throw;
+  }
+  c10::mcpu::setCurrentMcpuStream(stream);
+  TORCH_CHECK(caught == fail_submission);
+  TORCH_CHECK(!weak.expired(), "owner released before blocked tasks completed");
+  at::mcpu::launch_kernel([&ran] { ran.fetch_add(1); });
+  release.store(true);
+  TORCH_CHECK(orStreamSynchronize(stream) == orSuccess);
+  TORCH_CHECK(
+      weak.expired(), "invocation owner retained after stream completion");
+  return {destroyed.load(), ran.load(), max_owners};
+}
+
+std::tuple<int64_t, int64_t> kernel_launch_parallel_condition_counts(
+    const at::Tensor& selector,
+    int64_t launches) {
+  check_stream_test_tensor(selector);
+  TORCH_CHECK(launches > 0 && launches <= 4096);
+  constexpr int count = 4;
+  std::vector<c10::mcpu::McpuStream> streams;
+  for (int i = 0; i < count; ++i) {
+    streams.push_back(c10::mcpu::getStreamFromPool(i / 2));
+    (void)streams.back().stream();
+  }
+  std::atomic<int64_t> ran{0}, destroyed{0};
+  std::atomic<int> ready{0};
+  std::atomic<bool> go{false};
+  std::array<std::exception_ptr, count> errors{};
+  std::vector<std::thread> threads;
+  struct State {
+    explicit State(std::atomic<int64_t>* counter) : destroyed(counter) {}
+    ~State() {
+      ++*destroyed;
+    }
+    std::atomic<int64_t>* destroyed;
+    bool enabled = false;
+  };
+  for (int i = 0; i < count; ++i) {
+    threads.emplace_back([&, i] {
+      ++ready;
+      while (!go.load())
+        std::this_thread::yield();
+      try {
+        c10::mcpu::setCurrentMcpuStream(streams[i]);
+        auto state = std::make_shared<State>(&destroyed);
+        at::mcpu::KernelLaunchLifetimeScope lifetime(state);
+        auto* ptr = state.get();
+        at::mcpu::launch_kernel([ptr, i] { ptr->enabled = i % 2 == 0; });
+        at::mcpu::KernelLaunchConditionScope condition(lifetime, &ptr->enabled);
+        for (int64_t j = 0; j < launches; ++j) {
+          MCPU_LAUNCH_TIMED_KERNEL(
+              "mcpu::parallel_condition_test", ([&ran]), { ++ran; });
+        }
+      } catch (...) {
+        errors[i] = std::current_exception();
+      }
+    });
+  }
+  while (ready.load() != count)
+    std::this_thread::yield();
+  go.store(true);
+  for (auto& thread : threads)
+    thread.join();
+  for (auto stream : streams)
+    stream.synchronize();
+  for (auto error : errors)
+    if (error)
+      std::rethrow_exception(error);
+  return {ran.load(), destroyed.load()};
 }
 
 std::tuple<int64_t, int64_t, int64_t> kernel_launch_lifetime_counts(

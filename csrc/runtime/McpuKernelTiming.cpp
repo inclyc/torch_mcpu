@@ -8,7 +8,8 @@
 namespace at::mcpu::kernel_timing {
 namespace {
 
-ThreadBuffer g_worker_buffer{};
+std::array<Event, kMaxEventsPerThread> g_events{};
+std::atomic<std::size_t> g_event_count{0};
 
 } // namespace
 
@@ -19,25 +20,27 @@ void set_enabled(bool value) {
 }
 
 void reset() {
-  g_worker_buffer.count = 0;
+  // The caller must stop submissions and drain workers before resetting slots.
+  g_event_count.store(0, std::memory_order_relaxed);
 }
 
 Event* reserve_event_slot(const char* name, std::uint64_t stream) {
   if (!enabled()) {
     return nullptr;
   }
-  const std::size_t index = g_worker_buffer.count++;
-  if (C10_UNLIKELY(index >= kMaxEventsPerThread)) {
-    g_worker_buffer.count = kMaxEventsPerThread;
-    return nullptr;
-  }
-  Event& event = g_worker_buffer.events[index];
+  auto index = g_event_count.load(std::memory_order_relaxed);
+  do {
+    if (C10_UNLIKELY(index >= kMaxEventsPerThread))
+      return nullptr;
+  } while (!g_event_count.compare_exchange_weak(
+      index, index + 1, std::memory_order_relaxed));
+  Event& event = g_events[index];
   event = {name, stream, 0, 0};
   return &event;
 }
 
 std::size_t event_count() {
-  return std::min(g_worker_buffer.count, kMaxEventsPerThread);
+  return g_event_count.load(std::memory_order_relaxed);
 }
 
 double elapsed_us_between(std::size_t begin, std::size_t end) {
@@ -50,7 +53,7 @@ double elapsed_us_between(std::size_t begin, std::size_t end) {
 
   std::uint64_t elapsed_time = 0;
   for (std::size_t i = begin; i < end; ++i) {
-    const Event& event = g_worker_buffer.events[i];
+    const Event& event = g_events[i];
     if (event.end_time > event.begin_time) {
       elapsed_time += event.end_time - event.begin_time;
     }
@@ -61,12 +64,12 @@ double elapsed_us_between(std::size_t begin, std::size_t end) {
 std::vector<ThreadSnapshot> snapshot() {
   std::vector<ThreadSnapshot> out;
   out.reserve(1);
-  const std::size_t event_count =
-      std::min(g_worker_buffer.count, kMaxEventsPerThread);
+  // As with elapsed_us_between, read event payloads only after submission and
+  // stream completion. The atomic count makes reservation safe, not live reads.
+  const std::size_t count = event_count();
   ThreadSnapshot snapshot;
-  snapshot.role = g_worker_buffer.role;
-  snapshot.events.assign(
-      g_worker_buffer.events.begin(), g_worker_buffer.events.begin() + event_count);
+  snapshot.role = kWorkerRole;
+  snapshot.events.assign(g_events.begin(), g_events.begin() + count);
   out.push_back(std::move(snapshot));
   return out;
 }

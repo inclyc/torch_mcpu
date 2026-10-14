@@ -40,7 +40,9 @@ struct QueueSlot {
   std::atomic<std::uint64_t> sequence{0};
   RunFn run = nullptr;
   DestroyFn destroy = nullptr;
-  alignas(kQueueSlotStorageAlignment) unsigned char storage[256];
+  // On the 64-bit ABI, metadata and alignment occupy 32 bytes, making each
+  // slot 512 bytes and keeping slot starts cache-line aligned in orStream.
+  alignas(kQueueSlotStorageAlignment) unsigned char storage[480];
 };
 
 template <typename Func, typename... Args>
