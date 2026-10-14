@@ -2,10 +2,14 @@
 
 import gc
 import os
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+from pathlib import Path
 
 import torch
 
@@ -832,6 +836,250 @@ class TestCachingHostAllocator(TestCase):
         pinned = t.pin_memory()
         self.assertTrue(pinned.is_pinned())
         del pinned
+
+
+class TestSharedXmalloc(TestCase):
+    """Test shared backing through the installed MCPU allocation API."""
+
+    def run_child(self, code, path, size="4096", **extra_env):
+        env = os.environ.copy()
+        env.pop("TORCH_MCPU_SHARED_BASE", None)
+        env.update(TORCH_MCPU_SHARED_SIM_FILE=path, TORCH_MCPU_SHARED_SIZE=size)
+        env.update(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+        env.update(extra_env)
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(code)],
+            env=env, capture_output=True, text=True, timeout=45,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_premapped_backend_with_supplied_mapped_region(self):
+        compiler = shutil.which("c++")
+        if compiler is None:
+            self.skipTest("C++ compiler required for pre-mapped backend smoke test")
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = os.path.join(directory, "xmalloc-premapped-smoke")
+            result = subprocess.run(
+                [compiler, "-std=c++17", "-pthread", "-Wall", "-Wextra", "-Werror",
+                 "-DTORCH_MCPU_SHARED_USE_PREMAPPED=1", f"-I{root / 'include'}",
+                 f"-I{root / 'csrc'}", str(root / "csrc/runtime/OpenRegSharedAllocator.cpp"),
+                 str(root / "tests/xmalloc_premapped_smoke.cpp"), "-o", binary],
+                capture_output=True, text=True, timeout=45,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = subprocess.run(
+                [binary], capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_alignment_capacity_and_tensor_lifetime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_child("""
+                import gc
+                import torch
+                from torch_mcpu.shared_memory import xmalloc
+
+                a = xmalloc(1)
+                b = xmalloc(257)
+                assert a.data_ptr() % 256 == 0
+                assert b.data_ptr() - a.data_ptr() == 256
+                assert a.device.type == 'mcpu'
+                assert b.dtype == torch.uint8 and b.numel() == 257
+                assert not b.untyped_storage().resizable()
+                b.fill_(19)
+                view = b[1:]
+                del b
+                gc.collect()
+                torch.testing.assert_close(view.cpu(), torch.full((256,), 19, dtype=torch.uint8))
+                try:
+                    xmalloc(257)  # only 256 aligned bytes remain
+                except RuntimeError as error:
+                    assert 'exhausted' in str(error)
+                else:
+                    raise AssertionError('expected exhaustion')
+                c = xmalloc(256)  # failed allocation must not advance the cursor
+                assert c.data_ptr() - a.data_ptr() == 768
+                bf16 = c.view(torch.bfloat16).view(4, 32)
+                bf16.fill_(7)
+                torch.testing.assert_close(bf16.cpu(), torch.full((4, 32), 7, dtype=torch.bfloat16))
+                torch.testing.assert_close(view.cpu(), torch.full((256,), 19, dtype=torch.uint8))
+                # Ordinary device allocation still works independently.
+                ordinary = torch.ones(8, device='mcpu')
+                torch.testing.assert_close(ordinary.cpu(), torch.ones(8))
+            """, os.path.join(directory, "arena"), size="1024")
+
+    def test_two_rank_updates_and_group_isolation(self):
+        # Two TP groups use different files concurrently. Each pair exchanges
+        # readiness bytes only; all tensor data travels through xmalloc backing.
+        code = textwrap.dedent("""
+            import os
+            import socket
+            import sys
+            import time
+            import torch
+            from torch_mcpu.shared_memory import xmalloc
+
+            rank, fd, seed, attach_late = map(int, sys.argv[1:])
+            channel = socket.socket(fileno=fd)
+            channel.settimeout(20)
+            if rank == 1 and attach_late:
+                assert channel.recv(1) == b'I'
+            cache = xmalloc(4096).view(torch.int32).view(4, 256)
+            extra = xmalloc(257)
+            assert extra.data_ptr() - cache.data_ptr() == 4096
+            assert cache.data_ptr() % 256 == 0
+            if rank == 0:
+                cache.fill_(seed)
+                torch.mcpu.synchronize()
+                channel.sendall(b'I')
+                assert channel.recv(1) == b'A'
+            else:
+                if not attach_late:
+                    assert channel.recv(1) == b'I'
+                torch.testing.assert_close(cache.cpu(), torch.full((4, 256), seed, dtype=torch.int32))
+                channel.sendall(b'A')
+            expected = torch.full((4, 256), seed, dtype=torch.int32)
+            for step in range(32):
+                block = step % 4
+                values = torch.arange(256, dtype=torch.int32) + seed + step * 256
+                expected[block].copy_(values)
+                if rank == 0:
+                    cache[block].copy_(values)
+                    # A host notification alone does not finish queued kernels.
+                    torch.mcpu.synchronize()
+                    channel.sendall(b'R')
+                    assert channel.recv(1) == b'A'
+                else:
+                    assert channel.recv(1) == b'R'
+                    time.sleep(0.002)
+                    torch.testing.assert_close(cache.cpu(), expected)
+                    # The writer must not reuse the block until this read ends.
+                    channel.sendall(b'A')
+            channel.close()
+        """)
+        processes = []
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                for group in range(2):
+                    env = os.environ.copy()
+                    env.pop("TORCH_MCPU_SHARED_BASE", None)
+                    env.update(
+                        TORCH_MCPU_SHARED_SIM_FILE=os.path.join(directory, f"group-{group}"),
+                        TORCH_MCPU_SHARED_SIZE="8192",
+                        OMP_NUM_THREADS="1",
+                        MKL_NUM_THREADS="1",
+                    )
+                    left, right = socket.socketpair()
+                    try:
+                        for rank, channel in enumerate((left, right)):
+                            processes.append(subprocess.Popen(
+                                [sys.executable, "-c", code, str(rank),
+                                 str(channel.fileno()), str(1000 * group), str(group)],
+                                env=env, pass_fds=(channel.fileno(),),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True,
+                            ))
+                    finally:
+                        left.close()
+                        right.close()
+                failures = []
+                for process in processes:
+                    stdout, stderr = process.communicate(timeout=45)
+                    if process.returncode != 0:
+                        failures.append(f"PID {process.pid}: {stdout}{stderr}")
+                self.assertFalse(failures, "\n".join(failures))
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=10)
+
+    def test_invalid_configuration_and_sizes_do_not_allocate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_child("""
+                import os
+                from torch_mcpu.shared_memory import xmalloc
+
+                path = os.environ['TORCH_MCPU_SHARED_SIM_FILE']
+                for value in ('', '-1', '1x', '18446744073709551616', '0', '255'):
+                    os.environ['TORCH_MCPU_SHARED_SIZE'] = value
+                    try:
+                        xmalloc(1)
+                    except (RuntimeError, ValueError):
+                        pass
+                    else:
+                        raise AssertionError(f'accepted invalid size {value!r}')
+                del os.environ['TORCH_MCPU_SHARED_SIZE']
+                try:
+                    xmalloc(1)
+                except (RuntimeError, ValueError) as error:
+                    assert 'TORCH_MCPU_SHARED_SIZE' in str(error)
+                else:
+                    raise AssertionError('missing size was accepted')
+                os.environ['TORCH_MCPU_SHARED_SIZE'] = '0x1000'
+                for size in (0, -1, 1 << 64):
+                    try:
+                        xmalloc(size)
+                    except (RuntimeError, ValueError, OverflowError):
+                        pass
+                    else:
+                        raise AssertionError('invalid allocation accepted')
+                assert not os.path.exists(path)
+                del os.environ['TORCH_MCPU_SHARED_SIM_FILE']
+                try:
+                    xmalloc(1)
+                except (RuntimeError, ValueError) as error:
+                    assert 'TORCH_MCPU_SHARED_SIM_FILE' in str(error)
+                else:
+                    raise AssertionError('missing file was accepted')
+                os.environ['TORCH_MCPU_SHARED_SIM_FILE'] = path
+                assert xmalloc(4096).data_ptr() % 256 == 0
+            """, os.path.join(directory, "arena"))
+
+    def test_existing_region_size_mismatch_preserves_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "arena")
+            with open(path, "wb") as region:
+                region.write(b'x' * 512)
+            self.run_child("""
+                from torch_mcpu.shared_memory import xmalloc
+                try:
+                    xmalloc(256)
+                except (RuntimeError, ValueError) as error:
+                    assert 'size differs' in str(error)
+                else:
+                    raise AssertionError('size mismatch accepted')
+            """, path)
+            with open(path, "rb") as region:
+                self.assertEqual(region.read(), b'x' * 512)
+
+    def test_fixed_base_never_overwrites_existing_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.run_child("""
+                import ctypes
+                import mmap
+                import os
+                from torch_mcpu.shared_memory import xmalloc
+
+                occupied = mmap.mmap(-1, mmap.PAGESIZE)
+                address = ctypes.addressof(ctypes.c_char.from_buffer(occupied))
+                occupied[:4] = b'keep'
+                os.environ['TORCH_MCPU_SHARED_BASE'] = hex(address)
+                try:
+                    xmalloc(1)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError('overwrote an existing mapping')
+                assert occupied[:4] == b'keep'
+                occupied.close()
+                # This single-threaded setup has now made the address available.
+                allocation = xmalloc(256)
+                assert allocation.data_ptr() == address
+                allocation.fill_(23)
+                assert allocation.cpu().tolist() == [23] * 256
+            """, os.path.join(directory, "arena"), size=str(os.sysconf("SC_PAGESIZE")))
 
 
 if __name__ == "__main__":

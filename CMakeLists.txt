@@ -23,6 +23,8 @@ option(TORCH_MCPU_ENABLE_CPU_FALLBACK
        "Enable boxed CPU fallback for unimplemented mcpu operators" ON)
 option(TORCH_MCPU_ENABLE_SYNC_KERNEL_LAUNCH
        "Synchronize the launch stream after every mcpu kernel launch" OFF)
+option(TORCH_MCPU_SHARED_USE_PREMAPPED
+       "Use the pre-mapped shared arena instead of the Linux mmap simulator" OFF)
 
 if(APPLE)
   set(CMAKE_INSTALL_RPATH "@loader_path/lib;@loader_path;${PYTORCH_INSTALL_DIR}/lib")
