@@ -21,6 +21,19 @@ def _prefer_mcpu_profiler_fallback():
 
         torch.autograd._supported_activities = supported_without_mcpu_kineto
         autograd_profiler._supported_activities = supported_without_mcpu_kineto
+
+        # Newer PyTorch selects native PrivateUse1 tracing from use_kineto
+        # alone. MCPU supplies timing stubs, so explicitly select fallback.
+        original_init = autograd_profiler.profile.__init__
+        if not getattr(original_init, "_torch_mcpu_patched", False):
+
+            def init_with_mcpu_fallback(self, *args, **kwargs):
+                if kwargs.get("use_device") == "mcpu":
+                    kwargs["use_kineto"] = False
+                original_init(self, *args, **kwargs)
+
+            init_with_mcpu_fallback._torch_mcpu_patched = True
+            autograd_profiler.profile.__init__ = init_with_mcpu_fallback
     except Exception:
         pass
 
@@ -249,8 +262,8 @@ def _patch_export_chrome_trace():
     if getattr(original_export, "_torch_mcpu_patched", False):
         return
 
-    def export_chrome_trace_with_mcpu(self, path):
-        result = original_export(self, path)
+    def export_chrome_trace_with_mcpu(self, path, *args, **kwargs):
+        result = original_export(self, path, *args, **kwargs)
         if (
             torch._C._get_privateuse1_backend_name() == "mcpu"
             and os.environ.get("TORCH_MCPU_PATCH_PROFILER_TRACE", "1") != "0"

@@ -119,13 +119,21 @@ class TestProfiler(TestCase):
     @skipIfTorchDynamo()
     def test_profiler_key_averages(self):
         """Test that key_averages works correctly with OpenReg operations."""
-        with autograd_profile(use_device="mcpu") as prof:
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.PrivateUse1,
+            ]
+        ) as prof:
             for _ in range(10):
                 x = torch.randn(10, 10, device="mcpu")
                 x + x
 
         key_averages = prof.key_averages()
         self.assertGreater(len(key_averages), 0)
+        self.assertGreater(
+            sum(avg.self_device_time_total for avg in key_averages), 0
+        )
 
         # Verify we can access statistics
         for avg in key_averages:
@@ -427,7 +435,8 @@ class TestProfiler(TestCase):
         os.close(fd)
 
         try:
-            prof.export_chrome_trace(trace_file)
+            # tensorboard_trace_handler passes this export option explicitly.
+            prof.export_chrome_trace(trace_file, use_python_export=False)
             with open(trace_file, encoding="utf-8") as f:
                 trace_data = json.load(f)
 

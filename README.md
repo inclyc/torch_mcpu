@@ -211,6 +211,9 @@ print(f"Device of z: {z.device}")
 
 - [docs/how_to_impl_aten_ops.md](/shared/vllm-xcpu-dev-kit-0.19/torch_mcpu/docs/how_to_impl_aten_ops.md)
 
+Profiler 的使用方式、PyTorch 2.13 兼容修复和长期 Kineto 适配计划见
+[MCPU profiler 文档](docs/profiler.md)。
+
 ## 未来计划
 
 - **增强功能**：
@@ -221,6 +224,7 @@ print(f"Device of z: {z.device}")
   - 自定义 Tensor&Storage
   - ...
 - **改进测试**：添加更多与集成机制相关的测试用例。
+- **Profiler 原生 Kineto 接入（重要 TODO）**：工程化适配 PyTorch PrivateUse1 profiler 与 Kineto 的注册、采集生命周期、时钟和事件关联接口；当前 PyTorch 2.13 修改仅维护 fallback 兼容路径，详见 [profiler 适配计划](docs/profiler.md)。
 - **Stream 计时与观测性改进**：
   - 继续以当前 SPSC（single-producer/single-consumer）stream 队列作为主要性能取舍；同一个 stream 多 host producer 并发提交不是当前优化目标。
   - 将 profiler/kernel timing 的 event buffer 与 stream 并发模型对齐；优先评估 per-stream timing buffer，避免全局计数热点。
