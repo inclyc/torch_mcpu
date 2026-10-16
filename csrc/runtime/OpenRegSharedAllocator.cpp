@@ -130,8 +130,7 @@ uintptr_t open_region(uintptr_t requested_base, size_t size) {
     ::munmap(mapping, size);
     throw std::runtime_error("xmalloc: kernel did not honor fixed mapping");
   }
-  // Mapping survives fd close; the launcher removes the file after all ranks
-  // exit. Never unlink or truncate it while another rank may still attach.
+  // Mapping survives fd close. The caller removes the file after all ranks exit.
   return base;
 #endif
 }

@@ -12,9 +12,9 @@ import time
 from pathlib import Path
 
 import torch
+from torch.testing._internal.common_utils import TestCase, run_tests, skipIfTorchDynamo
 
 import torch_mcpu  # noqa: F401
-from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, TestCase
 
 
 class TestDeviceAllocator(TestCase):
@@ -849,7 +849,7 @@ class TestSharedXmalloc(TestCase):
         env.update(extra_env)
         result = subprocess.run(
             [sys.executable, "-c", textwrap.dedent(code)],
-            env=env, capture_output=True, text=True, timeout=45,
+            env=env, check=False, capture_output=True, text=True, timeout=45,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -865,11 +865,11 @@ class TestSharedXmalloc(TestCase):
                  "-DTORCH_MCPU_SHARED_USE_PREMAPPED=1", f"-I{root / 'include'}",
                  f"-I{root / 'csrc'}", str(root / "csrc/runtime/OpenRegSharedAllocator.cpp"),
                  str(root / "tests/xmalloc_premapped_smoke.cpp"), "-o", binary],
-                capture_output=True, text=True, timeout=45,
+                check=False, capture_output=True, text=True, timeout=45,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = subprocess.run(
-                [binary], capture_output=True, text=True, timeout=15,
+                [binary], check=False, capture_output=True, text=True, timeout=15,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -999,40 +999,25 @@ class TestSharedXmalloc(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.run_child("""
                 import os
+                import pytest
                 from torch_mcpu.shared_memory import xmalloc
 
                 path = os.environ['TORCH_MCPU_SHARED_SIM_FILE']
                 for value in ('', '-1', '1x', '18446744073709551616', '0', '255'):
                     os.environ['TORCH_MCPU_SHARED_SIZE'] = value
-                    try:
+                    with pytest.raises((RuntimeError, ValueError)):
                         xmalloc(1)
-                    except (RuntimeError, ValueError):
-                        pass
-                    else:
-                        raise AssertionError(f'accepted invalid size {value!r}')
                 del os.environ['TORCH_MCPU_SHARED_SIZE']
-                try:
+                with pytest.raises((RuntimeError, ValueError), match='TORCH_MCPU_SHARED_SIZE'):
                     xmalloc(1)
-                except (RuntimeError, ValueError) as error:
-                    assert 'TORCH_MCPU_SHARED_SIZE' in str(error)
-                else:
-                    raise AssertionError('missing size was accepted')
                 os.environ['TORCH_MCPU_SHARED_SIZE'] = '0x1000'
                 for size in (0, -1, 1 << 64):
-                    try:
+                    with pytest.raises((RuntimeError, ValueError, OverflowError)):
                         xmalloc(size)
-                    except (RuntimeError, ValueError, OverflowError):
-                        pass
-                    else:
-                        raise AssertionError('invalid allocation accepted')
                 assert not os.path.exists(path)
                 del os.environ['TORCH_MCPU_SHARED_SIM_FILE']
-                try:
+                with pytest.raises((RuntimeError, ValueError), match='TORCH_MCPU_SHARED_SIM_FILE'):
                     xmalloc(1)
-                except (RuntimeError, ValueError) as error:
-                    assert 'TORCH_MCPU_SHARED_SIM_FILE' in str(error)
-                else:
-                    raise AssertionError('missing file was accepted')
                 os.environ['TORCH_MCPU_SHARED_SIM_FILE'] = path
                 assert xmalloc(4096).data_ptr() % 256 == 0
             """, os.path.join(directory, "arena"))

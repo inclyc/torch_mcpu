@@ -1,8 +1,8 @@
 # Shared KV arena: `xmalloc`
 
-`c10::mcpu::xmalloc(bytes)` returns a non-resizable MCPU `uint8` tensor backed by
-process-lifetime shared memory. The allocation is aligned to 256 bytes and is
-never individually freed or reused.
+`c10::mcpu::xmalloc(bytes)` returns a pointer to process-lifetime shared memory.
+The Python wrapper returns a non-resizable MCPU `uint8` tensor. Allocations are
+aligned to 256 bytes and are never individually freed or reused.
 
 ```python
 from torch_mcpu.shared_memory import xmalloc
@@ -25,8 +25,8 @@ export TORCH_MCPU_SHARED_BASE=0x100000000
 
 Both ranks use the same fresh file and size. Different DP/TP groups use different
 files. `mmap(MAP_SHARED)` supplies the backing; an existing file must have the
-requested size and is never cleared on attach. The launcher removes files after
-all workers exit. A fixed base uses `MAP_FIXED_NOREPLACE` and never overwrites an
+requested size and is never cleared on attach. Remove the file after all workers
+exit. A fixed base uses `MAP_FIXED_NOREPLACE` and never overwrites an
 existing mapping.
 
 ## Pre-mapped device region
