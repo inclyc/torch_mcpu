@@ -14,6 +14,8 @@
 #include <runtime/OpenRegFunctions.h>
 #include <runtime/McpuOpTiming.h>
 #include <runtime/OpenRegStream.h>
+#include <runtime/OpenRegSharedAllocator.h>
+#include <limits>
 
 // Forward-declare allocator management functions from libtorch_mcpu.so.
 // (DeviceCachingAllocator.h transitively includes openreg.h which is not on
@@ -32,6 +34,37 @@ void registerMcpuDistributedBindings(PyObject* module);
 }
 
 namespace py = pybind11;
+
+static PyObject* _xmalloc(PyObject* self, PyObject* args) {
+  HANDLE_TH_ERRORS
+  PyObject* size_arg = nullptr;
+  int device_index = 0;
+  if (!PyArg_ParseTuple(args, "Oi", &size_arg, &device_index)) {
+    return nullptr;
+  }
+  const size_t size = PyLong_AsSize_t(size_arg);
+  if (PyErr_Occurred()) {
+    return nullptr;
+  }
+  TORCH_CHECK(
+      size > 0 &&
+          size <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+      "xmalloc size must be positive and fit in int64");
+  torch::utils::device_lazy_init(at::kPrivateUse1);
+  TORCH_CHECK(
+      device_index >= 0 && device_index < c10::mcpu::device_count(),
+      "invalid xmalloc device index");
+  const c10::Device device(c10::DeviceType::PrivateUse1, device_index);
+  auto tensor =
+      at::for_blob(c10::mcpu::xmalloc(size), {static_cast<int64_t>(size)})
+          .options(at::TensorOptions().dtype(at::kByte).device(device))
+          .target_device(device)
+          .make_tensor();
+  // The arena owns the memory until process exit. Storage deletion must not
+  // return it to the ordinary allocator, even if an async kernel still uses it.
+  return THPVariable_Wrap(tensor);
+  END_HANDLE_TH_ERRORS
+}
 
 static PyObject* _initExtension(PyObject* self, PyObject* noargs) {
   HANDLE_TH_ERRORS
@@ -329,6 +362,7 @@ static PyObject* _getKernelTiming(PyObject* self, PyObject* noargs) {
 
 // LITERALINCLUDE MCPU MODULE METHODS
 static PyMethodDef methods[] = {
+    {"_xmalloc", _xmalloc, METH_VARARGS, nullptr},
     {"_init", _initExtension, METH_NOARGS, nullptr},
     {"_get_default_generator", _getDefaultGenerator, METH_O, nullptr},
     {"_get_device", _getDevice, METH_NOARGS, nullptr},

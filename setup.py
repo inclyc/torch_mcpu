@@ -106,6 +106,8 @@ def build_deps():
         + build_options["TORCH_MCPU_ENABLE_CPU_FALLBACK"],
         "-DTORCH_MCPU_ENABLE_SYNC_KERNEL_LAUNCH="
         + build_options["TORCH_MCPU_ENABLE_SYNC_KERNEL_LAUNCH"],
+        "-DTORCH_MCPU_SHARED_USE_PREMAPPED="
+        + cmake_bool(os.getenv("TORCH_MCPU_SHARED_USE_PREMAPPED", "OFF")),
     ]
 
     subprocess.check_call(
